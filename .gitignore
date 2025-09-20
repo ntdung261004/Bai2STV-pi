@@ -1,0 +1,21 @@
+# Môi trường ảo (Virtual environment)
+venv/
+.venv/
+
+# File tạm
+*.pyc
+__pycache__/
+
+# Các file hệ thống
+.DS_Store
+
+# Các file logs
+*.log
+*.pt
+*.jpg
+# Các file cấu hình nhạy cảm
+# (ví dụ: file chứa mật khẩu, khóa API, vv.)
+*.env
+.env.production
+.env.development
+config.pyc
