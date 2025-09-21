@@ -12,6 +12,31 @@ from .utils import draw_crosshair_on_frame
 # Import audio_player đã tạo
 from .audio import audio_player
 
+class StatusReporterWorker(threading.Thread):
+    def __init__(self, send_status_func, trigger_listener, camera, interval=2):
+        super().__init__(daemon=True)
+        self.send_status_func = send_status_func
+        self.trigger_listener = trigger_listener
+        self.camera = camera
+        self.interval = interval
+
+    def run(self):
+        logging.info("Luồng Giám sát Trạng thái bắt đầu.")
+        while True:
+            # Kiểm tra trạng thái Cò bắn
+            if self.trigger_listener.is_connected():
+                self.send_status_func('trigger', 'ready')
+            else:
+                self.send_status_func('trigger', 'disconnected')
+
+            # Kiểm tra trạng thái Camera
+            if self.camera.is_running():
+                self.send_status_func('video', 'ready')
+            else:
+                self.send_status_func('video', 'disconnected')
+            
+            time.sleep(self.interval)
+            
 class TriggerListener(threading.Thread):
     def __init__(self, device_name, key_code, camera, queue, state_lock, get_state_func, can_fire_func, decrement_bullet_func):
         super().__init__(daemon=True)
@@ -26,6 +51,10 @@ class TriggerListener(threading.Thread):
         self.can_fire_func = can_fire_func
         self.decrement_bullet_func = decrement_bullet_func
         self.burst_session_id = 0
+
+    def is_connected(self):
+        """Hàm để worker khác kiểm tra trạng thái kết nối."""
+        return self.device is not None
 
     def find_device(self):
         devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
@@ -68,44 +97,36 @@ class TriggerListener(threading.Thread):
                 logging.warning("Dừng loạt bắn do không đủ điều kiện (hết đạn/hết giờ).")
                 break
 
-    # THAY THẾ TOÀN BỘ HÀM run BẰNG HÀM DƯỚI ĐÂY
     def run(self):
         logging.info("Đang tìm kiếm cò bắn Bluetooth...")
-        self.device = None
-        while self.device is None:
-            self.device = self.find_device()
-            if not self.device:
-                logging.warning(f"Chưa tìm thấy cò bắn '{self.device_name}'. Đang thử lại sau 5 giây...")
-                time.sleep(5)
-        
-        logging.info(f"✅ Đã kết nối với cò bắn: {self.device.name} tại {self.device.path}")
+        while True:
+            try:
+                if self.device is None:
+                    # Vòng lặp tìm kiếm, nhưng không gửi status ở đây nữa
+                    self.device = self.find_device()
+                    if self.device is None:
+                        time.sleep(5)
+                        continue
+                    logging.info(f"✅ Đã kết nối với cò bắn: {self.device.name}")
+                    self.device.grab()
+                for event in self.device.read_loop():
+                    if event.type == evdev.ecodes.EV_KEY and event.code == self.key_code:
+                        if event.value == 1 and not self.trigger_held:
+                            self.trigger_held = True
+                            self.burst_session_id += 1
+                            threading.Thread(target=self.fire_one_burst, args=(self.burst_session_id,)).start()
 
-        try:
-            # =================================================================
-            # THÊM MỚI: "Độc chiếm" thiết bị để ngăn hệ điều hành xử lý
-            # =================================================================
-            self.device.grab()
-            logging.info("Đã độc chiếm thiết bị. Hệ điều hành sẽ không nhận tín hiệu âm lượng nữa.")
-            # =================================================================
-
-            for event in self.device.read_loop():
-                if event.type == evdev.ecodes.EV_KEY and event.code == self.key_code:
-                    if event.value == 1 and not self.trigger_held:
-                        self.trigger_held = True
-                        self.burst_session_id += 1
-                        threading.Thread(target=self.fire_one_burst, args=(self.burst_session_id,)).start()
-
-                    elif event.value == 0:
-                        self.trigger_held = False
-        finally:
-            # =================================================================
-            # THÊM MỚI: "Nhả" thiết bị ra khi chương trình kết thúc
-            # =================================================================
-            if self.device:
-                self.device.ungrab()
-                logging.info("Đã nhả thiết bị.")
-            # =================================================================
-                                                  
+                        elif event.value == 0:
+                            self.trigger_held = False
+            except (IOError, OSError) as e:
+                logging.warning(f"⚠️ Mất kết nối cò bắn: {e}. Đang tìm kiếm lại...")
+                if self.device:
+                    try:
+                        self.device.ungrab()
+                    except: pass # Bỏ qua lỗi nếu ungrab không thành công
+                self.device = None # Quan trọng: đặt lại device là None
+                time.sleep(2) 
+                              
 class ProcessingWorker(threading.Thread):
     def __init__(self, queue):
         super().__init__(daemon=True)
@@ -154,7 +175,7 @@ class StreamerWorker(threading.Thread):
         self.get_state_func = get_state_func
         self.fps = fps
     def run(self):
-        print("Bắt đầu gửi luồng video tới server...")
+        logging.info("Luồng gửi video bắt đầu hoạt động.")
         while True:
             original_frame = self.camera.read()
             if original_frame is None: continue
@@ -169,6 +190,7 @@ class StreamerWorker(threading.Thread):
             except requests.exceptions.RequestException:
                 pass
             time.sleep(1 / self.fps)
+            
 class CommandPoller(threading.Thread):
     # SỬA ĐỔI: Thêm start_session_func vào hàm khởi tạo
     def __init__(self, poll_url, set_state_func, start_session_func):

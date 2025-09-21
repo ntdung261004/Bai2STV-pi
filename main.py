@@ -7,7 +7,7 @@ import evdev
 import socketio
 # Import từ các module đã tách
 from modules.camera import Camera
-from modules.workers import TriggerListener, ProcessingWorker, StreamerWorker, CommandPoller
+from modules.workers import TriggerListener, ProcessingWorker, StreamerWorker, CommandPoller, StatusReporterWorker
 # Import module âm thanh mới
 from modules.audio import audio_player
 
@@ -58,8 +58,16 @@ def disconnect():
     logging.warning("⚠️ Đã mất kết nối SocketIO tới server.")
 # =================================================================
 
+# --- HÀM GỬI TRẠNG THÁI ---
+def send_status_update(component, status):
+    """Gửi cập nhật trạng thái của một thành phần về server."""
+    if sio.connected:
+        logging.info(f"Gửi trạng thái: [{component}] -> {status}")
+        sio.emit('status_update', {'component': component, 'status': status})
+
 def get_current_state():
     return current_zoom, calibrated_center
+
 def set_state_from_command(command):
     global current_zoom, calibrated_center
     command_type = command.get('type')
@@ -142,34 +150,51 @@ def start_session():
 
 # --- KHỞI CHẠY CHƯƠNG TRÌNH ---
 if __name__ == '__main__':
-    # **SỬA ĐỔI**: Kết nối SocketIO tới server
     try:
         sio.connect(f"http://{SERVER_IP}:{SERVER_PORT}")
     except socketio.exceptions.ConnectionError as e:
-        logging.error(f"Lỗi kết nối SocketIO: {e}. Giao diện sẽ không cập nhật số đạn.")
-        
-    # THÊM MỚI: Tải file âm thanh khi chương trình bắt đầu
+        logging.error(f"Lỗi kết nối SocketIO: {e}")
+
     audio_player.load_sound('shot', 'sounds/shot.mp3')
-    logging.info("Chương trình khởi động. Trạng thái phiên bắn: INACTIVE.")
     camera = Camera(width=CAMERA_CAPTURE_WIDTH, height=CAMERA_CAPTURE_HEIGHT).start()
-    print(f"Camera đã khởi động ở chế độ {CAMERA_CAPTURE_WIDTH}x{CAMERA_CAPTURE_HEIGHT}.")
+    logging.info(f"Camera đã khởi động.")
     time.sleep(2.0)
 
-    # Khởi tạo các luồng worker (giữ nguyên)
+    # === SỬA ĐỔI LỚN: KHỞI TẠO CÁC WORKER ===
+    
+    # 1. Khởi tạo các worker chính trước
+    streamer_worker = StreamerWorker(camera, VIDEO_UPLOAD_URL, state_lock, get_current_state, FPS)
+    command_poller = CommandPoller(COMMAND_POLL_URL, set_state_from_command, start_session)
+    trigger_listener = TriggerListener(
+        TRIGGER_DEVICE_NAME, TRIGGER_KEY_CODE, camera, processing_queue, 
+        state_lock, get_current_state, can_fire, decrement_bullet
+    )
+    processing_worker = ProcessingWorker(processing_queue)
+
+    # 2. Khởi tạo worker giám sát, truyền các worker chính vào cho nó
+    status_reporter = StatusReporterWorker(send_status_update, trigger_listener, camera)
+
+    # 3. Gom tất cả vào danh sách để khởi chạy
     threads = [
-        StreamerWorker(camera, VIDEO_UPLOAD_URL, state_lock, get_current_state, FPS),
-        CommandPoller(COMMAND_POLL_URL, set_state_from_command, start_session),
-        TriggerListener(TRIGGER_DEVICE_NAME, TRIGGER_KEY_CODE, camera, processing_queue, state_lock, get_current_state, can_fire,decrement_bullet),
-        ProcessingWorker(processing_queue)
+        streamer_worker,
+        command_poller,
+        trigger_listener,
+        processing_worker,
+        status_reporter # <-- Worker mới
     ]
 
     for t in threads:
         t.start()
     
-    print("✅ Tất cả các luồng đã được khởi động. Hệ thống đang hoạt động.")
-
+    logging.info("✅ Tất cả các luồng đã được khởi động.")
+    
     try:
+        # Vòng lặp chính giữ chương trình chạy
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n🛑 Nhận tín hiệu thoát, chương trình sẽ kết thúc.")
+        logging.info("\n🛑 Nhận tín hiệu thoát, chương trình sẽ kết thúc.")
+    finally:
+        if sio.connected:
+            sio.disconnect()
+        camera.stop()
