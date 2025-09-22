@@ -13,8 +13,12 @@ from .utils import draw_crosshair_on_frame
 from .audio import audio_player
 
 class StatusReporterWorker(threading.Thread):
+    """
+    Một luồng nền chuyên giám sát trạng thái của các thành phần khác (camera, cò)
+    và gửi báo cáo định kỳ về server qua SocketIO.
+    """
     def __init__(self, send_status_func, trigger_listener, camera, interval=2):
-        super().__init__(daemon=True)
+        super().__init__(daemon=True, name="StatusReporter")
         self.send_status_func = send_status_func
         self.trigger_listener = trigger_listener
         self.camera = camera
@@ -168,37 +172,51 @@ class ProcessingWorker(threading.Thread):
 # ... (StreamerWorker và CommandPoller giữ nguyên không đổi) ...
 class StreamerWorker(threading.Thread):
     def __init__(self, camera, upload_url, state_lock, get_state_func, fps):
-        super().__init__(daemon=True)
+        super().__init__(daemon=True, name="StreamerWorker")
         self.camera = camera
         self.upload_url = upload_url
         self.state_lock = state_lock
         self.get_state_func = get_state_func
         self.fps = fps
+
     def run(self):
         logging.info("Luồng gửi video bắt đầu hoạt động.")
         while True:
+            # **SỬA LỖI QUAN TRỌNG**: Thêm kiểm tra camera có đang chạy không
+            if not self.camera.is_running():
+                time.sleep(1) # Nếu camera không chạy, đợi 1 giây rồi kiểm tra lại
+                continue
+
             original_frame = self.camera.read()
-            if original_frame is None: continue
+            # Kiểm tra lại một lần nữa phòng trường hợp camera vừa ngắt kết nối
+            if original_frame is None:
+                continue
+
             rotated_frame = cv2.rotate(original_frame, cv2.ROTATE_90_CLOCKWISE)
             with self.state_lock:
                 zoom_level, center_point = self.get_state_func()
+            
             frame_to_send = draw_crosshair_on_frame(rotated_frame, zoom_level, center_point)
             (flag, encodedImage) = cv2.imencode(".jpg", frame_to_send, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-            if not flag: continue
+            if not flag:
+                continue
+
             try:
-                requests.post(self.upload_url, data=bytearray(encodedImage), headers={'Content-Type': 'image/jpeg'}, timeout=1)
+                requests.post(self.upload_url, data=bytearray(encodedImage), headers={'Content-Type': 'image/jpeg'}, timeout=0.5)
             except requests.exceptions.RequestException:
+                # Lỗi kết nối khi gửi ảnh là bình thường, có thể bỏ qua log
                 pass
+            
             time.sleep(1 / self.fps)
             
 class CommandPoller(threading.Thread):
     # SỬA ĐỔI: Thêm start_session_func vào hàm khởi tạo
-    def __init__(self, poll_url, set_state_func, start_session_func):
+    def __init__(self, poll_url, set_state_func, start_session_func, reset_session_func):
         super().__init__(daemon=True)
         self.poll_url = poll_url
         self.set_state_func = set_state_func
         self.start_session_func = start_session_func # <-- Lưu lại hàm được truyền vào
-
+        self.reset_session_func = reset_session_func
     def run(self):
         logging.info("Bắt đầu lắng nghe lệnh từ server...")
         while True:
@@ -207,18 +225,21 @@ class CommandPoller(threading.Thread):
                 if response.status_code == 200:
                     data = response.json()
                     command = data.get('command')
-                    
                     if command:
-                        # =================================================================
-                        # SỬA ĐỔI: Xử lý lệnh 'start'
-                        # =================================================================
-                        if command.get('type') == 'start':
-                            logging.info("Nhận được lệnh 'start' từ server.")
-                            self.start_session_func() # Gọi hàm start_session từ main.py
+                        command_type = command.get('type')
+                        # Phân loại và xử lý lệnh
+                        if command_type == 'start':
+                            logging.info("Nhận được lệnh 'start'.")
+                            self.start_session_func()
+                        
+                        # **THÊM MỚI: Xử lý lệnh 'reset'**
+                        elif command_type == 'reset':
+                            logging.info("Nhận được lệnh 'reset'.")
+                            self.reset_session_func() # Gọi hàm reset từ main.py
+                        
                         else:
                             # Xử lý các lệnh khác như zoom, center
                             self.set_state_func(command)
-                        # =================================================================
 
             except requests.exceptions.RequestException:
                 # Lỗi kết nối là bình thường khi server chưa bật, nên ta có thể bỏ qua log này

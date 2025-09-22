@@ -65,6 +65,11 @@ def send_status_update(component, status):
         logging.info(f"Gửi trạng thái: [{component}] -> {status}")
         sio.emit('status_update', {'component': component, 'status': status})
 
+def send_ammo_update(ammo):
+    """Gửi số đạn còn lại về server."""
+    if sio.connected:
+        sio.emit('update_ammo', {'ammo': ammo})
+        
 def get_current_state():
     return current_zoom, calibrated_center
 
@@ -147,7 +152,18 @@ def start_session():
             # Phát âm thanh "xuất phát" trên Pi
             #audio_player.play('start_sound') 
 # =================================================================
-
+def reset_session():
+    """Hủy bỏ phiên tập hiện tại và reset các thông số."""
+    global session_active, bullet_count, session_end_time
+    with session_lock:
+        if session_active:
+            session_active = False
+            bullet_count = 0
+            session_end_time = None
+            logging.info("="*20 + " PHIÊN BẮN ĐÃ ĐƯỢC RESET " + "="*20)
+            # Gửi số đạn về 0 để giao diện cập nhật
+            send_ammo_update(bullet_count)
+            
 # --- KHỞI CHẠY CHƯƠNG TRÌNH ---
 if __name__ == '__main__':
     try:
@@ -164,7 +180,7 @@ if __name__ == '__main__':
     
     # 1. Khởi tạo các worker chính trước
     streamer_worker = StreamerWorker(camera, VIDEO_UPLOAD_URL, state_lock, get_current_state, FPS)
-    command_poller = CommandPoller(COMMAND_POLL_URL, set_state_from_command, start_session)
+    command_poller = CommandPoller(COMMAND_POLL_URL, set_state_from_command, start_session, reset_session)
     trigger_listener = TriggerListener(
         TRIGGER_DEVICE_NAME, TRIGGER_KEY_CODE, camera, processing_queue, 
         state_lock, get_current_state, can_fire, decrement_bullet

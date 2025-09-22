@@ -9,27 +9,19 @@ class Camera:
         self.src = src
         self.width = width
         self.height = height
-        self.stream = None # Sẽ được khởi tạo trong luồng
+        self.stream = None
         self.grabbed = False
         self.frame = None
         self.stopped = False
         self.lock = threading.Lock()
 
     def start(self):
-        # Khởi động luồng nền để đọc khung hình từ camera
         threading.Thread(target=self.update, args=(), daemon=True).start()
         return self
 
-    # =================================================================
-    # THAY THẾ TOÀN BỘ HÀM UPDATE BẰNG HÀM NÀY
-    # =================================================================
     def update(self):
-        """
-        Luồng chạy nền liên tục đọc khung hình và tự động kết nối lại nếu mất.
-        """
         while not self.stopped:
             if self.stream is None or not self.stream.isOpened():
-                # Nếu chưa có stream hoặc stream đã mất, thử kết nối
                 logging.info("Đang thử kết nối tới camera...")
                 self.stream = cv2.VideoCapture(self.src)
                 if self.stream.isOpened():
@@ -37,41 +29,41 @@ class Camera:
                     self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
                     logging.info("✅ Kết nối camera thành công!")
                 else:
-                    # Nếu kết nối thất bại, giải phóng và chờ để thử lại
                     self.stream.release()
                     self.stream = None
                     with self.lock:
                         self.grabbed = False
-                    time.sleep(3.0) # Chờ 3 giây trước khi thử lại
-                    continue # Bỏ qua vòng lặp này và thử lại từ đầu
+                        # **SỬA LỖI QUAN TRỌNG**: Khi kết nối thất bại, đặt frame là None
+                        self.frame = None
+                    time.sleep(3.0)
+                    continue
 
-            # Đọc khung hình từ stream đã kết nối
             is_read, frame = self.stream.read()
 
-            # Cập nhật trạng thái và khung hình một cách an toàn
             with self.lock:
                 self.grabbed = is_read
                 if is_read:
                     self.frame = frame
                 else:
-                    # Nếu đọc thất bại, có thể camera vừa bị rút ra
+                    # **SỬA LỖI QUAN TRỌNG**: Khi đọc thất bại, đặt frame là None
+                    self.frame = None
                     logging.warning("⚠️ Không thể đọc khung hình, camera có thể đã mất kết nối.")
                     self.stream.release()
                     self.stream = None
-    # =================================================================
-
+    
     def read(self):
-        """Trả về khung hình cuối cùng đã đọc được."""
         with self.lock:
-            return self.frame
+            # Sửa đổi nhỏ: Trả về một bản sao để tránh xung đột luồng
+            if self.frame is not None:
+                return self.frame.copy()
+            return None
 
     def is_running(self):
-        """Kiểm tra xem camera có đang chạy và đọc được khung hình không."""
         with self.lock:
+            # Trạng thái chạy nghĩa là không bị dừng và đang đọc được frame
             return not self.stopped and self.grabbed
 
     def stop(self):
-        """Dừng luồng và giải phóng tài nguyên."""
         self.stopped = True
         if self.stream:
             self.stream.release()
