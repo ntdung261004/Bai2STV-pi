@@ -7,7 +7,7 @@ import evdev
 import socketio
 # Import từ các module đã tách
 from modules.camera import Camera
-from modules.workers import TriggerListener, ProcessingWorker, StreamerWorker, CommandPoller, StatusReporterWorker
+from modules.workers import TriggerListener, ProcessingWorker, StreamerWorker, CommandPoller, StatusReporterWorker, SessionMonitorWorker
 # Import module âm thanh mới
 from modules.audio import audio_player
 
@@ -30,7 +30,7 @@ FINAL_FRAME_HEIGHT = 640
 session_lock = threading.Lock() # Lock để bảo vệ các biến này
 session_active = False
 bullet_count = 0
-SESSION_DURATION_SECONDS = 115 # Ví dụ: phiên kéo dài 3 phút (180 giây)
+SESSION_DURATION_SECONDS = 75 # Ví dụ: phiên kéo dài 3 phút (180 giây)
 session_end_time = None
 
 # --- TRẠNG THÁI TRUNG TÂM ---
@@ -119,19 +119,46 @@ def can_fire():
             
         return True
 
+def end_session(reason: str):
+    """Kết thúc phiên tập, ghi log, và gửi sự kiện 'session_ended' về server."""
+    global session_active
+    with session_lock:
+        # Chỉ thực hiện nếu phiên đang thực sự hoạt động
+        if session_active:
+            session_active = False
+            logging.info("="*25 + " PHIÊN BẮN ĐÃ KẾT THÚC " + "="*25)
+            logging.info(f"-> Lý do: {reason}")
+
+            # --- THÊM MỚI: Gửi sự kiện kết thúc phiên về server ---
+            if sio.connected:
+                logging.info(f"Gửi sự kiện 'session_ended' về server với lý do: {reason}")
+                sio.emit('session_ended', {'reason': reason})
+
+def get_session_state():
+    """Lấy trạng thái (active, end_time) của phiên bắn một cách an toàn."""
+    with session_lock:
+        # Trả về end_time hoặc một giá trị vô hạn nếu không active
+        # để tránh lỗi so sánh (None > float) trong worker
+        effective_end_time = session_end_time if session_end_time is not None else float('inf')
+        return session_active, effective_end_time
+    
 def decrement_bullet():
-    """Giảm số đạn đi một và gửi cập nhật về server."""
+    """Giảm số đạn đi một, gửi cập nhật và kiểm tra điều kiện hết đạn."""
     global bullet_count
+    ended_by_ammo = False # Cờ để gọi hàm end_session bên ngoài lock
     with session_lock:
         if bullet_count > 0:
             bullet_count -= 1
             logging.info(f"Đạn đã bắn! Số đạn còn lại: {bullet_count}")
-            # **SỬA ĐỔI**: Gửi số đạn mới về server
-            if sio.connected:
-                sio.emit('update_ammo', {'ammo': bullet_count})
-            
+            send_ammo_update(bullet_count) # Gửi số đạn mới về server
+
             if bullet_count == 0:
                 logging.info("="*20 + " HẾT ĐẠN " + "="*20)
+                ended_by_ammo = True # Đặt cờ
+
+    # Gọi hàm end_session sau khi đã nhả lock để tránh xung đột
+    if ended_by_ammo:
+        end_session("Hết đạn")
 
 def start_session():
     """Kích hoạt và reset các thông số cho một phiên bắn mới."""
@@ -185,8 +212,8 @@ if __name__ == '__main__':
         TRIGGER_DEVICE_NAME, TRIGGER_KEY_CODE, camera, processing_queue, 
         state_lock, get_current_state, can_fire, decrement_bullet
     )
-    processing_worker = ProcessingWorker(processing_queue)
-
+    processing_worker = ProcessingWorker(processing_queue, sio)
+    session_monitor = SessionMonitorWorker(session_lock, get_session_state, end_session)
     # 2. Khởi tạo worker giám sát, truyền các worker chính vào cho nó
     status_reporter = StatusReporterWorker(send_status_update, trigger_listener, camera)
 
@@ -196,7 +223,8 @@ if __name__ == '__main__':
         command_poller,
         trigger_listener,
         processing_worker,
-        status_reporter # <-- Worker mới
+        status_reporter,
+        session_monitor# <-- Worker mới
     ]
 
     for t in threads:

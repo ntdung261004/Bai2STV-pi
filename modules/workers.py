@@ -7,11 +7,38 @@ import requests
 import cv2
 import logging
 import os
+import base64
 from datetime import datetime
 from .utils import draw_crosshair_on_frame
 # Import audio_player đã tạo
 from .audio import audio_player
 
+class SessionMonitorWorker(threading.Thread):
+    """
+    Luồng nền chuyên giám sát thời gian của phiên bắn.
+    Nếu hết giờ, nó sẽ tự động gọi hàm để kết thúc phiên.
+    """
+    def __init__(self, session_lock, get_session_state_func, end_session_func, interval=1):
+        super().__init__(daemon=True, name="SessionMonitor")
+        self.session_lock = session_lock
+        self.get_session_state_func = get_session_state_func
+        self.end_session_func = end_session_func
+        self.interval = interval # Tần suất kiểm tra (mỗi giây)
+        logging.info("Luồng Giám sát Phiên bắn đã được khởi tạo.")
+
+    def run(self):
+        logging.info("Luồng Giám sát Phiên bắn bắt đầu hoạt động.")
+        while True:
+            # Lấy trạng thái phiên bắn một cách an toàn từ main.py
+            is_active, end_time = self.get_session_state_func()
+            
+            # Chỉ kiểm tra nếu phiên đang hoạt động
+            if is_active and time.time() > end_time:
+                logging.info("Phát hiện phiên bắn đã hết thời gian quy định.")
+                self.end_session_func("Hết thời gian") # Gọi hàm kết thúc phiên
+            
+            time.sleep(self.interval)
+            
 class StatusReporterWorker(threading.Thread):
     """
     Một luồng nền chuyên giám sát trạng thái của các thành phần khác (camera, cò)
@@ -132,42 +159,56 @@ class TriggerListener(threading.Thread):
                 time.sleep(2) 
                               
 class ProcessingWorker(threading.Thread):
-    def __init__(self, queue):
-        super().__init__(daemon=True)
+    # Sửa đổi: Thêm sio_client vào hàm khởi tạo
+    def __init__(self, queue, sio_client):
+        super().__init__(daemon=True, name="ProcessingWorker")
         self.queue = queue
+        self.sio_client = sio_client # <-- Lưu lại sio_client
         self.base_captures_dir = "captures"
         os.makedirs(self.base_captures_dir, exist_ok=True)
+        logging.info("Luồng Xử lý Ảnh đã được khởi tạo.")
 
     def run(self):
-        print("🛠️  Luồng xử lý ảnh đã sẵn sàng...")
+        logging.info("Luồng Xử lý Ảnh bắt đầu hoạt động.")
         while True:
             try:
                 shot_data = self.queue.get()
-                
                 burst_id = shot_data["burst_id"]
                 shot_id = shot_data["shot_id"]
-                
-                print(f"--- (Loạt {burst_id}, Phát {shot_id})! --- Đang xử lý...")
-                
-                # Tạo thư mục con cho loạt bắn nếu chưa có
+                logging.info(f"--- (Loạt {burst_id}, Phát {shot_id})! --- Đang xử lý...")
+
                 burst_dir = os.path.join(self.base_captures_dir, f"burst_{burst_id}")
                 os.makedirs(burst_dir, exist_ok=True)
-                
+
                 frame_to_process = shot_data["frame"]
                 zoom_at_shot = shot_data["zoom"]
                 center_at_shot = shot_data["center"]
-                
+
                 rotated_frame = cv2.rotate(frame_to_process, cv2.ROTATE_90_CLOCKWISE)
                 final_image = draw_crosshair_on_frame(rotated_frame, zoom_at_shot, center_at_shot)
-                
-                # Lưu ảnh vào thư mục con tương ứng
+
+                # --- LOGIC CŨ: LƯU ẢNH (Vẫn giữ lại để backup) ---
                 filename = os.path.join(burst_dir, f"shot_{shot_id}.jpg")
                 cv2.imwrite(filename, final_image)
-                print(f"✅ Đã xử lý và lưu thành công file {filename}")
+                logging.info(f"✅ Đã xử lý và lưu thành công file {filename}")
+
+                # --- LOGIC MỚI: GỬI ẢNH VỀ SERVER ---
+                if self.sio_client and self.sio_client.connected:
+                    # Mã hóa ảnh sang định dạng JPEG rồi sang Base64
+                    _, buffer = cv2.imencode('.jpg', final_image)
+                    jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+                    
+                    # Gửi dữ liệu base64 qua socket
+                    logging.info(f"Gửi ảnh của phát bắn {shot_id} về server...")
+                    self.sio_client.emit('new_shot_image', {
+                        'shot_id': shot_id,
+                        'image_data': f"data:image/jpeg;base64,{jpg_as_text}"
+                    })
+                # ----------------------------------------
 
                 self.queue.task_done()
             except Exception as e:
-                print(f"Lỗi khi xử lý ảnh: {e}")
+                logging.error(f"Lỗi khi xử lý ảnh: {e}")
 
 # ... (StreamerWorker và CommandPoller giữ nguyên không đổi) ...
 class StreamerWorker(threading.Thread):
