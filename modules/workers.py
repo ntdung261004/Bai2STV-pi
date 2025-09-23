@@ -12,6 +12,7 @@ from datetime import datetime
 from .utils import draw_crosshair_on_frame
 # Import audio_player đã tạo
 from .audio import audio_player
+from .yolo_predictor import analyze_shot
 
 class SessionMonitorWorker(threading.Thread):
     """
@@ -30,7 +31,7 @@ class SessionMonitorWorker(threading.Thread):
         logging.info("Luồng Giám sát Phiên bắn bắt đầu hoạt động.")
         while True:
             # Lấy trạng thái phiên bắn một cách an toàn từ main.py
-            is_active, end_time = self.get_session_state_func()
+            is_active, end_time, _ = self.get_session_state_func()
             
             # Chỉ kiểm tra nếu phiên đang hoạt động
             if is_active and time.time() > end_time:
@@ -97,35 +98,37 @@ class TriggerListener(threading.Thread):
     def fire_one_burst(self, current_burst_id):
         shot_in_burst_index = 0
         while self.trigger_held:
+            logging.info("[TriggerListener] Kiểm tra điều kiện có thể bắn (can_fire)...")
             if self.can_fire_func():
                 self.decrement_bullet_func()
 
                 with self.state_lock:
                     zoom, center = self.get_state_func()
                 
+                logging.info("[TriggerListener] Đang đọc khung hình từ camera...")
                 frame = self.camera.read()
+
                 if frame is not None:
-                    # =================================================================
-                    # SỬA LỖI: Bổ sung lại các key bị thiếu
-                    # =================================================================
+                    logging.info("=> [TriggerListener] Đọc khung hình thành công.")
                     shot_id = f"{current_burst_id}-{shot_in_burst_index}"
                     shot_data = {
-                        'frame': frame,
-                        'timestamp': datetime.now(),
-                        'shot_id': shot_id,           # ID duy nhất cho file ảnh
-                        'burst_id': current_burst_id, # ID cho thư mục loạt bắn
-                        'shot_index': shot_in_burst_index, # Index của phát bắn
-                        'zoom': zoom,
-                        'center': center
+                        'frame': frame, 'timestamp': datetime.now(), 'shot_id': shot_id,
+                        'burst_id': current_burst_id, 'shot_index': shot_in_burst_index,
+                        'zoom': zoom, 'center': center
                     }
-                    # =================================================================
+                    
+                    logging.info(f"[TriggerListener] Chuẩn bị đưa dữ liệu phát bắn {shot_id} vào hàng đợi...")
                     self.queue.put(shot_data)
+                    logging.info("=> [TriggerListener] Đã đưa vào hàng đợi thành công!")
+                    
                     audio_player.play('shot')
+                else:
+                    logging.error("=> [TriggerListener] LỖI: Không thể đọc khung hình từ camera (frame is None).")
                 
                 shot_in_burst_index += 1
                 time.sleep(0.1) 
             else:
-                logging.warning("Dừng loạt bắn do không đủ điều kiện (hết đạn/hết giờ).")
+                logging.warning("[TriggerListener] Dừng loạt bắn do không đủ điều kiện (hết đạn/hết giờ).")
                 break
 
     def run(self):
@@ -159,73 +162,65 @@ class TriggerListener(threading.Thread):
                 time.sleep(2) 
                               
 class ProcessingWorker(threading.Thread):
-    def __init__(self, queue, sio_client):
+    # SỬA LẠI __INIT__ ĐỂ NHẬN ĐỦ THAM SỐ
+    def __init__(self, queue, sio_client, register_hit_func, get_session_state_func, end_session_func):
         super().__init__(daemon=True, name="ProcessingWorker")
         self.queue = queue
         self.sio_client = sio_client
+        self.register_hit_func = register_hit_func
+        self.get_session_state_func = get_session_state_func
+        self.end_session_func = end_session_func
         self.base_captures_dir = "captures"
-        
-        # --- THÊM MỚI: Khai báo và tạo thư mục cho dataset YOLO ---
         self.yolo_dataset_dir = "yolo_dataset"
         os.makedirs(self.base_captures_dir, exist_ok=True)
-        os.makedirs(self.yolo_dataset_dir, exist_ok=True) # Tạo thư mục nếu chưa có
-        # ---------------------------------------------------------
-        
+        os.makedirs(self.yolo_dataset_dir, exist_ok=True)
         logging.info("Luồng Xử lý Ảnh đã được khởi tạo.")
 
     def run(self):
         logging.info("Luồng Xử lý Ảnh bắt đầu hoạt động.")
         while True:
             try:
+                # Log này sẽ hiện ra khi worker sẵn sàng nhận dữ liệu
+                logging.info("[ProcessingWorker] Đang chờ ảnh từ hàng đợi...")
                 shot_data = self.queue.get()
+                
+                center_at_shot = shot_data["center"]
                 shot_id = shot_data["shot_id"]
                 burst_id = shot_data["burst_id"]
                 timestamp = shot_data["timestamp"]
-                logging.info(f"--- (Loạt {burst_id}, Phát {shot_id})! --- Đang xử lý...")
-                
                 frame_to_process = shot_data["frame"]
+                zoom_at_shot = shot_data["zoom"]
+
+                logging.info(f"--- [ProcessingWorker] (Loạt {burst_id}, Phát {shot_id})! --- Đã nhận, bắt đầu xử lý.")
                 rotated_frame = cv2.rotate(frame_to_process, cv2.ROTATE_90_CLOCKWISE)
 
-                # --- SỬA ĐỔI: Lưu ảnh GỐC cho dataset YOLO với tên là timestamp ---
-                # Định dạng timestamp thành chuỗi: YYYYMMDD_HHMMSS_microseconds
+                logging.info(f"Bắt đầu phân tích AI cho phát bắn {shot_id}...")
+                hit_target_name = analyze_shot(rotated_frame, center_at_shot)
+                if hit_target_name:
+                    logging.info(f"Kết quả phân tích: TRÚNG '{hit_target_name}'. Đang ghi nhận...")
+                    self.register_hit_func(hit_target_name)
+                else:
+                    logging.info(f"Kết quả phân tích: TRƯỢT.")
+
                 time_str = timestamp.strftime("%Y%m%d_%H%M%S_%f")
-                
-                # Tạo tên file mới và đường dẫn đầy đủ
-                yolo_image_filename = f"{time_str}.jpg"
-                yolo_image_path = os.path.join(self.yolo_dataset_dir, yolo_image_filename)
-                
+                yolo_image_path = os.path.join(self.yolo_dataset_dir, f"{time_str}.jpg")
                 cv2.imwrite(yolo_image_path, rotated_frame)
-                logging.info(f"💾 Đã lưu ảnh cho dataset YOLO: {yolo_image_path}")
-                # --------------------------------------------------------------------
-
-                # --- LOGIC CŨ (giữ nguyên): Xử lý ảnh để xem lại ---
-                # Tạo thư mục con cho loạt bắn
-                burst_dir = os.path.join(self.base_captures_dir, f"burst_{burst_id}")
-                os.makedirs(burst_dir, exist_ok=True)
                 
-                # Vẽ tâm ngắm lên ảnh để xem lại
-                zoom_at_shot = shot_data["zoom"]
-                center_at_shot = shot_data["center"]
                 final_image_for_review = draw_crosshair_on_frame(rotated_frame, zoom_at_shot, center_at_shot)
-                
-                # Lưu ảnh đã vẽ tâm ngắm vào thư mục loạt bắn
-                review_filename = os.path.join(burst_dir, f"shot_{shot_id}.jpg")
-                cv2.imwrite(review_filename, final_image_for_review)
-                logging.info(f"✅ Đã xử lý và lưu ảnh review thành công: {review_filename}")
-
-                # Gửi ảnh đã vẽ tâm ngắm về server để hiển thị trên modal
                 if self.sio_client and self.sio_client.connected:
                     _, buffer = cv2.imencode('.jpg', final_image_for_review)
                     jpg_as_text = base64.b64encode(buffer).decode('utf-8')
-                    self.sio_client.emit('new_shot_image', {
-                        'shot_id': shot_id,
-                        'image_data': f"data:image/jpeg;base64,{jpg_as_text}"
-                    })
+                    self.sio_client.emit('new_shot_image', { 'shot_id': shot_id, 'image_data': f"data:image/jpeg;base64,{jpg_as_text}" })
+                
+                is_active, _, ammo_left = self.get_session_state_func()
+                if is_active and ammo_left == 0:
+                    logging.info("Xử lý xong ảnh cuối và phát hiện hết đạn. Đang gọi kết thúc phiên...")
+                    self.end_session_func('Hết đạn')
 
                 self.queue.task_done()
             except Exception as e:
                 logging.error(f"Lỗi khi xử lý ảnh: {e}")
-
+                
 # ... (StreamerWorker và CommandPoller giữ nguyên không đổi) ...
 class StreamerWorker(threading.Thread):
     def __init__(self, camera, upload_url, state_lock, get_state_func, fps):

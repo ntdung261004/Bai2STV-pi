@@ -10,6 +10,8 @@ from modules.camera import Camera
 from modules.workers import TriggerListener, ProcessingWorker, StreamerWorker, CommandPoller, StatusReporterWorker, SessionMonitorWorker
 # Import module âm thanh mới
 from modules.audio import audio_player
+from typing import Set # Thêm import này
+from modules.yolo_predictor import analyze_shot
 
 # --- CẤU HÌNH ---
 # ... (Toàn bộ phần cấu hình giữ nguyên)
@@ -30,8 +32,9 @@ FINAL_FRAME_HEIGHT = 640
 session_lock = threading.Lock() # Lock để bảo vệ các biến này
 session_active = False
 bullet_count = 0
-SESSION_DURATION_SECONDS = 75 # Ví dụ: phiên kéo dài 3 phút (180 giây)
+SESSION_DURATION_SECONDS = 87 # Ví dụ: phiên kéo dài 3 phút (180 giây)
 session_end_time = None
+hit_targets_session: Set[str] = set()
 
 # --- TRẠNG THÁI TRUNG TÂM ---
 # ... (Phần này giữ nguyên)
@@ -124,32 +127,66 @@ def end_session(reason: str):
     global session_active, bullet_count # Thêm bullet_count vào global
     with session_lock:
         if session_active:
-            # --- LOGIC MỚI: Tính toán số đạn đã bắn ---
+            # --- SỬA ĐỔI: Tính toán kết quả trước khi kết thúc ---
             shots_fired = 16 - bullet_count
-            # ----------------------------------------
-            
+            hit_count = len(hit_targets_session)
+            achievement = calculate_achievement(hit_targets_session)
+
             session_active = False
             logging.info("="*25 + " PHIÊN BẮN ĐÃ KẾT THÚC " + "="*25)
             logging.info(f"-> Lý do: {reason}")
-            logging.info(f"-> Tổng số phát bắn: {shots_fired}")
+            logging.info(f"-> Kết quả: {hit_count} mục tiêu trúng - Xếp loại: {achievement}")
 
             if sio.connected:
-                logging.info(f"Gửi sự kiện 'session_ended' về server...")
-                # Sửa đổi: Gửi kèm `total_shots`
-                sio.emit('session_ended', {'reason': reason, 'total_shots': shots_fired})
-
+                sio.emit('session_ended', {
+                    'reason': reason,
+                    'total_shots': shots_fired,
+                    'hit_count': hit_count,
+                    'achievement': achievement
+                })
+                
 def get_session_state():
-    """Lấy trạng thái (active, end_time) của phiên bắn một cách an toàn."""
+    """Lấy trạng thái (active, end_time, ammo) của phiên bắn một cách an toàn."""
     with session_lock:
-        # Trả về end_time hoặc một giá trị vô hạn nếu không active
-        # để tránh lỗi so sánh (None > float) trong worker
         effective_end_time = session_end_time if session_end_time is not None else float('inf')
-        return session_active, effective_end_time
+        # Sửa đổi: Trả về thêm cả bullet_count
+        return session_active, effective_end_time, bullet_count
     
+def register_hit(target_name: str):
+    """
+    Ghi nhận một mục tiêu đã bị bắn trúng một cách an toàn (thread-safe).
+    Hàm này sẽ được gọi từ ProcessingWorker.
+    """
+    with session_lock:
+        # Chỉ ghi nhận nếu mục tiêu chưa có trong danh sách và phiên đang hoạt động
+        if session_active and target_name not in hit_targets_session:
+            hit_targets_session.add(target_name)
+            logging.info(f"✅ Ghi nhận trúng mục tiêu mới: {target_name}. Tổng số mục tiêu đã trúng: {len(hit_targets_session)}")
+
+            # Gửi cập nhật về giao diện ngay lập tức
+            if sio.connected:
+                sio.emit('target_hit_update', {'target_name': target_name})
+
+def calculate_achievement(hit_targets: Set[str]):
+    """
+    Tính toán thành tích dựa trên danh sách các mục tiêu đã trúng.
+    """
+    hit_count = len(hit_targets)
+    has_bia_8c = 'bia_so_8c' in hit_targets
+
+    if hit_count >= 5:
+        return "Giỏi"
+    if hit_count == 4 and has_bia_8c:
+        return "Khá"
+    # Trường hợp 4 bia nhưng không có bia 8c, hoặc 3 bia -> Đạt
+    if hit_count >= 3:
+        return "Đạt"
+
+    return "Không đạt"
+
 def decrement_bullet():
-    """Giảm số đạn đi một, gửi cập nhật và kiểm tra điều kiện hết đạn."""
+    """Giảm số đạn đi một và gửi cập nhật về server."""
     global bullet_count
-    ended_by_ammo = False # Cờ để gọi hàm end_session bên ngoài lock
     with session_lock:
         if bullet_count > 0:
             bullet_count -= 1
@@ -158,11 +195,6 @@ def decrement_bullet():
 
             if bullet_count == 0:
                 logging.info("="*20 + " HẾT ĐẠN " + "="*20)
-                ended_by_ammo = True # Đặt cờ
-
-    # Gọi hàm end_session sau khi đã nhả lock để tránh xung đột
-    if ended_by_ammo:
-        end_session("Hết đạn")
 
 def start_session():
     """Kích hoạt và reset các thông số cho một phiên bắn mới."""
@@ -171,6 +203,7 @@ def start_session():
         # Bỏ điều kiện "if not session_active" để lệnh "start" luôn reset lại phiên
         session_active = True
         bullet_count = 16
+        hit_targets_session.clear()
         session_end_time = time.time() + SESSION_DURATION_SECONDS
         
         logging.info("="*20 + " PHIÊN BẮN MỚI BẮT ĐẦU " + "="*20)
@@ -191,6 +224,7 @@ def reset_session():
             session_active = False
             bullet_count = 0
             session_end_time = None
+            hit_targets_session.clear()
             logging.info("="*20 + " PHIÊN BẮN ĐÃ ĐƯỢC RESET " + "="*20)
             # Gửi số đạn về 0 để giao diện cập nhật
             send_ammo_update(bullet_count)
@@ -216,7 +250,14 @@ if __name__ == '__main__':
         TRIGGER_DEVICE_NAME, TRIGGER_KEY_CODE, camera, processing_queue, 
         state_lock, get_current_state, can_fire, decrement_bullet
     )
-    processing_worker = ProcessingWorker(processing_queue, sio)
+    processing_worker = ProcessingWorker(
+        processing_queue, 
+        sio, 
+        register_hit,
+        get_session_state_func=get_session_state,
+        end_session_func=end_session
+        )
+    
     session_monitor = SessionMonitorWorker(session_lock, get_session_state, end_session)
     # 2. Khởi tạo worker giám sát, truyền các worker chính vào cho nó
     status_reporter = StatusReporterWorker(send_status_update, trigger_listener, camera)
