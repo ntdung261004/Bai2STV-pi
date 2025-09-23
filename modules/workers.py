@@ -159,13 +159,18 @@ class TriggerListener(threading.Thread):
                 time.sleep(2) 
                               
 class ProcessingWorker(threading.Thread):
-    # Sửa đổi: Thêm sio_client vào hàm khởi tạo
     def __init__(self, queue, sio_client):
         super().__init__(daemon=True, name="ProcessingWorker")
         self.queue = queue
-        self.sio_client = sio_client # <-- Lưu lại sio_client
+        self.sio_client = sio_client
         self.base_captures_dir = "captures"
+        
+        # --- THÊM MỚI: Khai báo và tạo thư mục cho dataset YOLO ---
+        self.yolo_dataset_dir = "yolo_dataset"
         os.makedirs(self.base_captures_dir, exist_ok=True)
+        os.makedirs(self.yolo_dataset_dir, exist_ok=True) # Tạo thư mục nếu chưa có
+        # ---------------------------------------------------------
+        
         logging.info("Luồng Xử lý Ảnh đã được khởi tạo.")
 
     def run(self):
@@ -173,38 +178,49 @@ class ProcessingWorker(threading.Thread):
         while True:
             try:
                 shot_data = self.queue.get()
-                burst_id = shot_data["burst_id"]
                 shot_id = shot_data["shot_id"]
+                burst_id = shot_data["burst_id"]
+                timestamp = shot_data["timestamp"]
                 logging.info(f"--- (Loạt {burst_id}, Phát {shot_id})! --- Đang xử lý...")
+                
+                frame_to_process = shot_data["frame"]
+                rotated_frame = cv2.rotate(frame_to_process, cv2.ROTATE_90_CLOCKWISE)
 
+                # --- SỬA ĐỔI: Lưu ảnh GỐC cho dataset YOLO với tên là timestamp ---
+                # Định dạng timestamp thành chuỗi: YYYYMMDD_HHMMSS_microseconds
+                time_str = timestamp.strftime("%Y%m%d_%H%M%S_%f")
+                
+                # Tạo tên file mới và đường dẫn đầy đủ
+                yolo_image_filename = f"{time_str}.jpg"
+                yolo_image_path = os.path.join(self.yolo_dataset_dir, yolo_image_filename)
+                
+                cv2.imwrite(yolo_image_path, rotated_frame)
+                logging.info(f"💾 Đã lưu ảnh cho dataset YOLO: {yolo_image_path}")
+                # --------------------------------------------------------------------
+
+                # --- LOGIC CŨ (giữ nguyên): Xử lý ảnh để xem lại ---
+                # Tạo thư mục con cho loạt bắn
                 burst_dir = os.path.join(self.base_captures_dir, f"burst_{burst_id}")
                 os.makedirs(burst_dir, exist_ok=True)
-
-                frame_to_process = shot_data["frame"]
+                
+                # Vẽ tâm ngắm lên ảnh để xem lại
                 zoom_at_shot = shot_data["zoom"]
                 center_at_shot = shot_data["center"]
+                final_image_for_review = draw_crosshair_on_frame(rotated_frame, zoom_at_shot, center_at_shot)
+                
+                # Lưu ảnh đã vẽ tâm ngắm vào thư mục loạt bắn
+                review_filename = os.path.join(burst_dir, f"shot_{shot_id}.jpg")
+                cv2.imwrite(review_filename, final_image_for_review)
+                logging.info(f"✅ Đã xử lý và lưu ảnh review thành công: {review_filename}")
 
-                rotated_frame = cv2.rotate(frame_to_process, cv2.ROTATE_90_CLOCKWISE)
-                final_image = draw_crosshair_on_frame(rotated_frame, zoom_at_shot, center_at_shot)
-
-                # --- LOGIC CŨ: LƯU ẢNH (Vẫn giữ lại để backup) ---
-                filename = os.path.join(burst_dir, f"shot_{shot_id}.jpg")
-                cv2.imwrite(filename, final_image)
-                logging.info(f"✅ Đã xử lý và lưu thành công file {filename}")
-
-                # --- LOGIC MỚI: GỬI ẢNH VỀ SERVER ---
+                # Gửi ảnh đã vẽ tâm ngắm về server để hiển thị trên modal
                 if self.sio_client and self.sio_client.connected:
-                    # Mã hóa ảnh sang định dạng JPEG rồi sang Base64
-                    _, buffer = cv2.imencode('.jpg', final_image)
+                    _, buffer = cv2.imencode('.jpg', final_image_for_review)
                     jpg_as_text = base64.b64encode(buffer).decode('utf-8')
-                    
-                    # Gửi dữ liệu base64 qua socket
-                    logging.info(f"Gửi ảnh của phát bắn {shot_id} về server...")
                     self.sio_client.emit('new_shot_image', {
                         'shot_id': shot_id,
                         'image_data': f"data:image/jpeg;base64,{jpg_as_text}"
                     })
-                # ----------------------------------------
 
                 self.queue.task_done()
             except Exception as e:

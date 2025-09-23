@@ -121,18 +121,22 @@ def can_fire():
 
 def end_session(reason: str):
     """Kết thúc phiên tập, ghi log, và gửi sự kiện 'session_ended' về server."""
-    global session_active
+    global session_active, bullet_count # Thêm bullet_count vào global
     with session_lock:
-        # Chỉ thực hiện nếu phiên đang thực sự hoạt động
         if session_active:
+            # --- LOGIC MỚI: Tính toán số đạn đã bắn ---
+            shots_fired = 16 - bullet_count
+            # ----------------------------------------
+            
             session_active = False
             logging.info("="*25 + " PHIÊN BẮN ĐÃ KẾT THÚC " + "="*25)
             logging.info(f"-> Lý do: {reason}")
+            logging.info(f"-> Tổng số phát bắn: {shots_fired}")
 
-            # --- THÊM MỚI: Gửi sự kiện kết thúc phiên về server ---
             if sio.connected:
-                logging.info(f"Gửi sự kiện 'session_ended' về server với lý do: {reason}")
-                sio.emit('session_ended', {'reason': reason})
+                logging.info(f"Gửi sự kiện 'session_ended' về server...")
+                # Sửa đổi: Gửi kèm `total_shots`
+                sio.emit('session_ended', {'reason': reason, 'total_shots': shots_fired})
 
 def get_session_state():
     """Lấy trạng thái (active, end_time) của phiên bắn một cách an toàn."""
