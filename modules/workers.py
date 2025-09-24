@@ -1,4 +1,4 @@
-# file: modules/workers.py
+# file: modules/workers.py (phiên bản OOP, dựa trên logic gốc của bạn)
 import threading
 import time
 import queue
@@ -10,83 +10,60 @@ import os
 import base64
 from datetime import datetime
 from .utils import draw_crosshair_on_frame
-# Import audio_player đã tạo
 from .audio import audio_player
 from .yolo_predictor import analyze_shot
 
+# LƯU Ý: Các lớp Worker đã được cập nhật để nhận vào một đối tượng 'app' duy nhất.
+
 class SessionMonitorWorker(threading.Thread):
-    """
-    Luồng nền chuyên giám sát thời gian của phiên bắn.
-    Nếu hết giờ, nó sẽ tự động gọi hàm để kết thúc phiên.
-    """
-    def __init__(self, session_lock, get_session_state_func, end_session_func, interval=1):
+    def __init__(self, app):
         super().__init__(daemon=True, name="SessionMonitor")
-        self.session_lock = session_lock
-        self.get_session_state_func = get_session_state_func
-        self.end_session_func = end_session_func
-        self.interval = interval # Tần suất kiểm tra (mỗi giây)
+        self.app = app
         logging.info("Luồng Giám sát Phiên bắn đã được khởi tạo.")
 
     def run(self):
         logging.info("Luồng Giám sát Phiên bắn bắt đầu hoạt động.")
-        while True:
-            # Lấy trạng thái phiên bắn một cách an toàn từ main.py
-            is_active, end_time, _ = self.get_session_state_func()
-            
-            # Chỉ kiểm tra nếu phiên đang hoạt động
+        while not self.app.is_stopping():
+            is_active, end_time, _ = self.app.get_session_state()
             if is_active and time.time() > end_time:
                 logging.info("Phát hiện phiên bắn đã hết thời gian quy định.")
-                self.end_session_func("Hết thời gian") # Gọi hàm kết thúc phiên
-            
-            time.sleep(self.interval)
-            
+                self.app.end_session("Hết thời gian")
+            time.sleep(1)
+
 class StatusReporterWorker(threading.Thread):
-    """
-    Một luồng nền chuyên giám sát trạng thái của các thành phần khác (camera, cò)
-    và gửi báo cáo định kỳ về server qua SocketIO.
-    """
-    def __init__(self, send_status_func, trigger_listener, camera, interval=2):
+    def __init__(self, app, trigger_listener, camera):
         super().__init__(daemon=True, name="StatusReporter")
-        self.send_status_func = send_status_func
+        self.app = app
         self.trigger_listener = trigger_listener
         self.camera = camera
-        self.interval = interval
 
     def run(self):
         logging.info("Luồng Giám sát Trạng thái bắt đầu.")
-        while True:
-            # Kiểm tra trạng thái Cò bắn
+        while not self.app.is_stopping():
             if self.trigger_listener.is_connected():
-                self.send_status_func('trigger', 'ready')
+                self.app.send_status_update('trigger', 'ready')
             else:
-                self.send_status_func('trigger', 'disconnected')
+                self.app.send_status_update('trigger', 'disconnected')
 
-            # Kiểm tra trạng thái Camera
             if self.camera.is_running():
-                self.send_status_func('video', 'ready')
+                self.app.send_status_update('video', 'ready')
             else:
-                self.send_status_func('video', 'disconnected')
-            
-            time.sleep(self.interval)
-            
+                self.app.send_status_update('video', 'disconnected')
+            time.sleep(2)
+
 class TriggerListener(threading.Thread):
-    def __init__(self, device_name, key_code, camera, queue, state_lock, get_state_func, can_fire_func, decrement_bullet_func):
-        super().__init__(daemon=True)
+    def __init__(self, app, device_name, key_code):
+        super().__init__(daemon=True, name="TriggerListener")
+        self.app = app
         self.device_name = device_name
         self.key_code = key_code
-        self.camera = camera
-        self.queue = queue
         self.device = None
         self.trigger_held = False
-        self.state_lock = state_lock
-        self.get_state_func = get_state_func
-        self.can_fire_func = can_fire_func
-        self.decrement_bullet_func = decrement_bullet_func
         self.burst_session_id = 0
+        self._is_connected = False
 
     def is_connected(self):
-        """Hàm để worker khác kiểm tra trạng thái kết nối."""
-        return self.device is not None
+        return self._is_connected
 
     def find_device(self):
         devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
@@ -94,82 +71,70 @@ class TriggerListener(threading.Thread):
             if self.device_name.lower() in device.name.lower():
                 return device
         return None
-    
+
     def fire_one_burst(self, current_burst_id):
         shot_in_burst_index = 0
         while self.trigger_held:
-            logging.info("[TriggerListener] Kiểm tra điều kiện có thể bắn (can_fire)...")
-            if self.can_fire_func():
-                self.decrement_bullet_func()
+            if self.app.is_stopping(): break
 
-                with self.state_lock:
-                    zoom, center = self.get_state_func()
-                
-                logging.info("[TriggerListener] Đang đọc khung hình từ camera...")
-                frame = self.camera.read()
-
+            if self.app.can_fire():
+                self.app.decrement_bullet()
+                frame = self.app.camera.read()
                 if frame is not None:
-                    logging.info("=> [TriggerListener] Đọc khung hình thành công.")
+                    zoom, center = self.app.get_current_state()
                     shot_id = f"{current_burst_id}-{shot_in_burst_index}"
                     shot_data = {
                         'frame': frame, 'timestamp': datetime.now(), 'shot_id': shot_id,
                         'burst_id': current_burst_id, 'shot_index': shot_in_burst_index,
                         'zoom': zoom, 'center': center
                     }
-                    
-                    logging.info(f"[TriggerListener] Chuẩn bị đưa dữ liệu phát bắn {shot_id} vào hàng đợi...")
-                    self.queue.put(shot_data)
-                    logging.info("=> [TriggerListener] Đã đưa vào hàng đợi thành công!")
-                    
+                    self.app.processing_queue.put(shot_data)
                     audio_player.play('shot')
                 else:
-                    logging.error("=> [TriggerListener] LỖI: Không thể đọc khung hình từ camera (frame is None).")
+                    logging.error("LỖI: Không thể đọc khung hình từ camera khi bắn.")
                 
                 shot_in_burst_index += 1
-                time.sleep(0.1) 
+                time.sleep(0.1)
             else:
-                logging.warning("[TriggerListener] Dừng loạt bắn do không đủ điều kiện (hết đạn/hết giờ).")
+                logging.warning("Dừng loạt bắn do không đủ điều kiện (hết đạn/hết giờ/phiên dừng).")
                 break
 
     def run(self):
-        logging.info("Đang tìm kiếm cò bắn Bluetooth...")
-        while True:
+        logging.info(f"Bắt đầu tìm kiếm cò bắn '{self.device_name}'...")
+        while not self.app.is_stopping():
             try:
                 if self.device is None:
-                    # Vòng lặp tìm kiếm, nhưng không gửi status ở đây nữa
                     self.device = self.find_device()
                     if self.device is None:
+                        self._is_connected = False
                         time.sleep(5)
                         continue
                     logging.info(f"✅ Đã kết nối với cò bắn: {self.device.name}")
                     self.device.grab()
+                    self._is_connected = True
+                
                 for event in self.device.read_loop():
+                    if self.app.is_stopping(): break
                     if event.type == evdev.ecodes.EV_KEY and event.code == self.key_code:
-                        if event.value == 1 and not self.trigger_held:
+                        if event.value == 1 and not self.trigger_held: # Key press
                             self.trigger_held = True
                             self.burst_session_id += 1
                             threading.Thread(target=self.fire_one_burst, args=(self.burst_session_id,)).start()
-
-                        elif event.value == 0:
+                        elif event.value == 0: # Key release
                             self.trigger_held = False
             except (IOError, OSError) as e:
                 logging.warning(f"⚠️ Mất kết nối cò bắn: {e}. Đang tìm kiếm lại...")
                 if self.device:
-                    try:
-                        self.device.ungrab()
-                    except: pass # Bỏ qua lỗi nếu ungrab không thành công
-                self.device = None # Quan trọng: đặt lại device là None
-                time.sleep(2) 
-                              
+                    try: self.device.ungrab()
+                    except: pass
+                self.device = None
+                self._is_connected = False
+                time.sleep(2)
+
 class ProcessingWorker(threading.Thread):
-    # SỬA LẠI __INIT__ ĐỂ NHẬN ĐỦ THAM SỐ
-    def __init__(self, queue, sio_client, register_hit_func, get_session_state_func, end_session_func):
+    def __init__(self, app):
         super().__init__(daemon=True, name="ProcessingWorker")
-        self.queue = queue
-        self.sio_client = sio_client
-        self.register_hit_func = register_hit_func
-        self.get_session_state_func = get_session_state_func
-        self.end_session_func = end_session_func
+        self.app = app
         self.base_captures_dir = "captures"
         self.yolo_dataset_dir = "yolo_dataset"
         os.makedirs(self.base_captures_dir, exist_ok=True)
@@ -178,122 +143,88 @@ class ProcessingWorker(threading.Thread):
 
     def run(self):
         logging.info("Luồng Xử lý Ảnh bắt đầu hoạt động.")
-        while True:
+        while not self.app.is_stopping():
             try:
-                # Log này sẽ hiện ra khi worker sẵn sàng nhận dữ liệu
-                logging.info("[ProcessingWorker] Đang chờ ảnh từ hàng đợi...")
-                shot_data = self.queue.get()
+                shot_data = self.app.processing_queue.get(timeout=1)
                 
-                center_at_shot = shot_data["center"]
-                shot_id = shot_data["shot_id"]
-                burst_id = shot_data["burst_id"]
-                timestamp = shot_data["timestamp"]
-                frame_to_process = shot_data["frame"]
-                zoom_at_shot = shot_data["zoom"]
-
-                logging.info(f"--- [ProcessingWorker] (Loạt {burst_id}, Phát {shot_id})! --- Đã nhận, bắt đầu xử lý.")
-                rotated_frame = cv2.rotate(frame_to_process, cv2.ROTATE_90_CLOCKWISE)
-
-                logging.info(f"Bắt đầu phân tích AI cho phát bắn {shot_id}...")
-                hit_target_name = analyze_shot(rotated_frame, center_at_shot)
+                rotated_frame = cv2.rotate(shot_data["frame"], cv2.ROTATE_90_CLOCKWISE)
+                
+                hit_target_name = analyze_shot(rotated_frame, shot_data["center"])
                 if hit_target_name:
-                    logging.info(f"Kết quả phân tích: TRÚNG '{hit_target_name}'. Đang ghi nhận...")
-                    self.register_hit_func(hit_target_name)
-                else:
-                    logging.info(f"Kết quả phân tích: TRƯỢT.")
-
-                time_str = timestamp.strftime("%Y%m%d_%H%M%S_%f")
+                    self.app.register_hit(hit_target_name)
+                
+                # Lưu ảnh và gửi review (logic gốc)
+                time_str = shot_data["timestamp"].strftime("%Y%m%d_%H%M%S_%f")
                 yolo_image_path = os.path.join(self.yolo_dataset_dir, f"{time_str}.jpg")
                 cv2.imwrite(yolo_image_path, rotated_frame)
                 
-                final_image_for_review = draw_crosshair_on_frame(rotated_frame, zoom_at_shot, center_at_shot)
-                if self.sio_client and self.sio_client.connected:
-                    _, buffer = cv2.imencode('.jpg', final_image_for_review)
-                    jpg_as_text = base64.b64encode(buffer).decode('utf-8')
-                    self.sio_client.emit('new_shot_image', { 'shot_id': shot_id, 'image_data': f"data:image/jpeg;base64,{jpg_as_text}" })
+                final_image_for_review = draw_crosshair_on_frame(rotated_frame, shot_data["zoom"], shot_data["center"])
+                _, buffer = cv2.imencode('.jpg', final_image_for_review)
+                jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+                self.app.sio.emit('new_shot_image', { 'shot_id': shot_data['shot_id'], 'image_data': f"data:image/jpeg;base64,{jpg_as_text}" })
                 
-                is_active, _, ammo_left = self.get_session_state_func()
+                # Kiểm tra hết đạn sau khi xử lý
+                is_active, _, ammo_left = self.app.get_session_state()
                 if is_active and ammo_left == 0:
-                    logging.info("Xử lý xong ảnh cuối và phát hiện hết đạn. Đang gọi kết thúc phiên...")
-                    self.end_session_func('Hết đạn')
+                    logging.info("Xử lý xong ảnh cuối và phát hiện hết đạn. Kết thúc phiên.")
+                    self.app.end_session('Hết đạn')
 
-                self.queue.task_done()
+                self.app.processing_queue.task_done()
+            except queue.Empty:
+                continue
             except Exception as e:
-                logging.error(f"Lỗi khi xử lý ảnh: {e}")
-                
-# ... (StreamerWorker và CommandPoller giữ nguyên không đổi) ...
+                logging.error(f"Lỗi trong ProcessingWorker: {e}", exc_info=True)
+
 class StreamerWorker(threading.Thread):
-    def __init__(self, camera, upload_url, state_lock, get_state_func, fps):
+    def __init__(self, app):
         super().__init__(daemon=True, name="StreamerWorker")
-        self.camera = camera
-        self.upload_url = upload_url
-        self.state_lock = state_lock
-        self.get_state_func = get_state_func
-        self.fps = fps
+        self.app = app
 
     def run(self):
         logging.info("Luồng gửi video bắt đầu hoạt động.")
-        while True:
-            # **SỬA LỖI QUAN TRỌNG**: Thêm kiểm tra camera có đang chạy không
-            if not self.camera.is_running():
-                time.sleep(1) # Nếu camera không chạy, đợi 1 giây rồi kiểm tra lại
+        while not self.app.is_stopping():
+            if not self.app.camera.is_running():
+                time.sleep(1)
                 continue
 
-            original_frame = self.camera.read()
-            # Kiểm tra lại một lần nữa phòng trường hợp camera vừa ngắt kết nối
-            if original_frame is None:
-                continue
+            original_frame = self.app.camera.read()
+            if original_frame is None: continue
 
             rotated_frame = cv2.rotate(original_frame, cv2.ROTATE_90_CLOCKWISE)
-            with self.state_lock:
-                zoom_level, center_point = self.get_state_func()
-            
+            zoom_level, center_point = self.app.get_current_state()
             frame_to_send = draw_crosshair_on_frame(rotated_frame, zoom_level, center_point)
-            (flag, encodedImage) = cv2.imencode(".jpg", frame_to_send, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-            if not flag:
-                continue
+            
+            flag, encodedImage = cv2.imencode(".jpg", frame_to_send, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not flag: continue
 
             try:
-                requests.post(self.upload_url, data=bytearray(encodedImage), headers={'Content-Type': 'image/jpeg'}, timeout=0.5)
+                requests.post(self.app.video_upload_url, data=bytearray(encodedImage), headers={'Content-Type': 'image/jpeg'}, timeout=0.5)
             except requests.exceptions.RequestException:
-                # Lỗi kết nối khi gửi ảnh là bình thường, có thể bỏ qua log
                 pass
             
-            time.sleep(1 / self.fps)
-            
+            time.sleep(1 / self.app.fps)
+
 class CommandPoller(threading.Thread):
-    # SỬA ĐỔI: Thêm start_session_func vào hàm khởi tạo
-    def __init__(self, poll_url, set_state_func, start_session_func, reset_session_func):
-        super().__init__(daemon=True)
-        self.poll_url = poll_url
-        self.set_state_func = set_state_func
-        self.start_session_func = start_session_func # <-- Lưu lại hàm được truyền vào
-        self.reset_session_func = reset_session_func
+    def __init__(self, app):
+        super().__init__(daemon=True, name="CommandPoller")
+        self.app = app
+
     def run(self):
         logging.info("Bắt đầu lắng nghe lệnh từ server...")
-        while True:
+        while not self.app.is_stopping():
             try:
-                response = requests.get(self.poll_url, timeout=5)
+                response = requests.get(self.app.command_poll_url, timeout=5)
                 if response.status_code == 200:
                     data = response.json()
                     command = data.get('command')
                     if command:
                         command_type = command.get('type')
-                        # Phân loại và xử lý lệnh
                         if command_type == 'start':
-                            logging.info("Nhận được lệnh 'start'.")
-                            self.start_session_func()
-                        
-                        # **THÊM MỚI: Xử lý lệnh 'reset'**
+                            self.app.start_session()
                         elif command_type == 'reset':
-                            logging.info("Nhận được lệnh 'reset'.")
-                            self.reset_session_func() # Gọi hàm reset từ main.py
-                        
+                            self.app.reset_session()
                         else:
-                            # Xử lý các lệnh khác như zoom, center
-                            self.set_state_func(command)
-
+                            self.app.set_state_from_command(command)
             except requests.exceptions.RequestException:
-                # Lỗi kết nối là bình thường khi server chưa bật, nên ta có thể bỏ qua log này
                 pass
-            time.sleep(1) # Chờ 1 giây giữa mỗi lần hỏi
+            time.sleep(1)
