@@ -181,33 +181,50 @@ class StreamerWorker(threading.Thread):
         self.app = app
 
     def run(self):
-        logging.info("Luồng gửi video (SocketIO) bắt đầu hoạt động.")
+        logging.info("Luồng gửi video bắt đầu hoạt động.")
         while not self.app.is_stopping():
-            # Kiểm tra kết nối camera và kết nối socket
-            if not self.app.camera.is_running() or not self.app.sio.connected:
-                time.sleep(0.5)
+            if not self.app.camera.is_running():
+                time.sleep(1)
                 continue
 
             original_frame = self.app.camera.read()
-            if original_frame is None:
-                continue
+            if original_frame is None: continue
 
-            # Xoay và vẽ tâm ngắm (logic cũ giữ nguyên)
             rotated_frame = cv2.rotate(original_frame, cv2.ROTATE_90_CLOCKWISE)
             zoom_level, center_point = self.app.get_current_state()
             frame_to_send = draw_crosshair_on_frame(rotated_frame, zoom_level, center_point)
             
-            # Nén ảnh thành JPEG với chất lượng 80 để tối ưu dung lượng
-            flag, encodedImage = cv2.imencode(".jpg", frame_to_send, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            if not flag:
-                continue
+            flag, encodedImage = cv2.imencode(".jpg", frame_to_send, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not flag: continue
 
-            # **THAY ĐỔI LỚN: GỬI QUA SOCKET.IO**
-            # 1. Mã hóa ảnh JPEG sang dạng chuỗi Base64
-            jpg_as_text = base64.b64encode(encodedImage).decode('utf-8')
+            try:
+                requests.post(self.app.video_upload_url, data=bytearray(encodedImage), headers={'Content-Type': 'image/jpeg'}, timeout=0.5)
+            except requests.exceptions.RequestException:
+                pass
             
-            # 2. Gửi đi qua sự kiện 'video_frame_from_pi'
-            self.app.sio.emit('video_frame_from_pi', {'image': jpg_as_text})
-            
-            # Giữ tốc độ khung hình ổn định
             time.sleep(1 / self.app.fps)
+
+class CommandPoller(threading.Thread):
+    def __init__(self, app):
+        super().__init__(daemon=True, name="CommandPoller")
+        self.app = app
+
+    def run(self):
+        logging.info("Bắt đầu lắng nghe lệnh từ server...")
+        while not self.app.is_stopping():
+            try:
+                response = requests.get(self.app.command_poll_url, timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    command = data.get('command')
+                    if command:
+                        command_type = command.get('type')
+                        if command_type == 'start':
+                            self.app.start_session()
+                        elif command_type == 'reset':
+                            self.app.reset_session()
+                        else:
+                            self.app.set_state_from_command(command)
+            except requests.exceptions.RequestException:
+                pass
+            time.sleep(1)

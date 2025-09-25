@@ -22,6 +22,7 @@ SERVER_PORT = 5000
 # URL đầy đủ để giao tiếp với server (tự động tạo, không cần sửa)
 BASE_URL = f"http://{SERVER_IP}:{SERVER_PORT}"
 VIDEO_UPLOAD_URL = f"{BASE_URL}/pi/video_upload"
+COMMAND_POLL_URL = f"{BASE_URL}/pi/get_command"
 
 
 # --- CẤU HÌNH CAMERA & VIDEO ---
