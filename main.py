@@ -98,7 +98,12 @@ class ShootingRangeApp:
                 achievement = self.calculate_achievement(self.hit_targets_session); self.session_active = False
                 logging.info("="*25 + " PHIÊN BẮN ĐÃ KẾT THÚC " + "="*25)
                 if self.sio.connected: self.sio.emit('session_ended', {
-                    'reason': reason, 'total_shots': shots_fired, 'hit_count': hit_count, 'achievement': achievement
+                    'reason': reason,
+                    'total_shots': shots_fired,
+                    'hit_count': hit_count,
+                    'achievement': achievement,
+                    # **THÊM MỚI:** Gửi danh sách các mục tiêu đã trúng (chuyển từ set qua list)
+                    'hit_target_names': list(self.hit_targets_session)
                 })
 
     def can_fire(self):
